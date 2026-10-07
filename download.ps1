@@ -1,7 +1,11 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     下载本仓库 Release 中的考研英语黄皮书 PDF。
+
+.DESCRIPTION
+    先尝试 github.com 直链；若网络无法访问 github.com（部分网络环境下会被阻断），
+    自动改用 api.github.com 资产接口下载，该接口通常仍可访问。
 
 .EXAMPLE
     .\download.ps1
@@ -13,8 +17,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string]   $Repo  = 'IKTNF/kaoyan-english-huangpishu',
-    [string]   $Tag   = 'latest',
+    [string]   $Repo   = 'IKTNF/kaoyan-english-huangpishu',
+    [string]   $Tag    = 'latest',
     [string]   $OutDir = (Join-Path $PSScriptRoot 'pdf'),
     [string[]] $Only
 )
@@ -30,23 +34,38 @@ $assets = [ordered]@{
 }
 
 if ($Only) {
-    $missing = @($Only | Where-Object { -not $assets.Contains($_) })
-    if ($missing) { throw "未知的别名: $($missing -join ', ')。可用: $($assets.Keys -join ', ')" }
+    $bad = @($Only | Where-Object { -not $assets.Contains($_) })
+    if ($bad) { throw "未知别名: $($bad -join ', ')。可用: $($assets.Keys -join ', ')" }
 }
 $keys = if ($Only) { @($Only) } else { @($assets.Keys) }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 Write-Host "输出目录: $OutDir`n" -ForegroundColor Cyan
 
-$from = if ($Tag -eq 'latest') { 'releases/latest/download' } else { "releases/download/$Tag" }
+$commitish = if ($Tag -eq 'latest') { 'latest' } else { "tags/$Tag" }
+$direct    = if ($Tag -eq 'latest') { "https://github.com/$Repo/releases/latest/download" }
+             else                    { "https://github.com/$Repo/releases/download/$Tag" }
+
+if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+    throw 'curl.exe 不可用（Windows 10 1803+ 自带）。'
+}
+
+# 解析资产 id，供 api.github.com 备用通道使用（github.com 被阻断时）
+function Get-AssetId([string]$Name) {
+    try {
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/$commitish" `
+                   -Headers @{ 'User-Agent' = 'dsh-download'; Accept = 'application/vnd.github+json' } `
+                   -TimeoutSec 30
+        $hit = @($rel.assets | Where-Object { $_.name -eq $Name })
+        if ($hit.Count -gt 0) { return $hit[0].id }
+    } catch { }
+    return $null
+}
 
 foreach ($k in $keys) {
     $a    = $assets[$k]
-    $url  = "https://github.com/$Repo/$from/$($a.Name)"
     $dest = Join-Path $OutDir $a.Name
-    $gb   = [math]::Round($a.MB / 1024, 2)
-    Write-Host "==> $($a.Desc)  (~$gb GB)" -ForegroundColor Yellow
-    Write-Host "    $url"
+    Write-Host "==> $($a.Desc)  (~$([math]::Round($a.MB/1024,2)) GB)" -ForegroundColor Yellow
 
     if ((Test-Path -LiteralPath $dest) -and
         [math]::Abs((Get-Item -LiteralPath $dest).Length / 1MB - $a.MB) -lt 5) {
@@ -54,19 +73,27 @@ foreach ($k in $keys) {
         continue
     }
 
-    # git 的远程传输走 git 协议；大文件用 curl 支持断点续传
-    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if ($curl) {
-        & $curl.Source -L --fail --retry 5 --retry-delay 5 -C - -o $dest $url
-    } else {
-        Invoke-WebRequest -Uri $url -OutFile $dest
+    # 通道 1: github.com 直链（支持断点续传）
+    Write-Host "    通道1 github.com ..."
+    & curl.exe -L --fail --retry 3 --retry-delay 5 -C - -o $dest "$direct/$($a.Name)"
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $dest)) {
+        Write-Host "    完成: $([math]::Round((Get-Item -LiteralPath $dest).Length/1MB,1)) MB`n" -ForegroundColor Green
+        continue
     }
 
+    # 通道 2: api.github.com 资产接口（github.com 不可达时仍可用）
+    Write-Host "    通道1 失败 (exit $LASTEXITCODE)，改用 api.github.com ..." -ForegroundColor DarkYellow
+    $id = Get-AssetId $a.Name
+    if (-not $id) { Write-Warning "    无法解析资产 id，放弃: $($a.Name)"; continue }
+
+    & curl.exe -L --fail --retry 3 --retry-delay 5 -C - -o $dest `
+        -H 'Accept: application/octet-stream' `
+        "https://api.github.com/repos/$Repo/releases/assets/$id"
+
     if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $dest)) {
-        $mb = [math]::Round((Get-Item -LiteralPath $dest).Length / 1MB, 1)
-        Write-Host "    完成: $mb MB`n" -ForegroundColor Green
+        Write-Host "    完成(备用通道): $([math]::Round((Get-Item -LiteralPath $dest).Length/1MB,1)) MB`n" -ForegroundColor Green
     } else {
-        Write-Warning "    下载失败 (exit $LASTEXITCODE): $($a.Name)"
+        Write-Warning "    两条通道均失败: $($a.Name)"
     }
 }
 Write-Host '全部任务结束。' -ForegroundColor Cyan
